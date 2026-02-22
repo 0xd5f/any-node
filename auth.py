@@ -61,7 +61,7 @@ async def authenticate(request):
         if not user:
             return web.json_response({"ok": False, "msg": "User not found"}, status=401)
 
-        if user.get("blocked", False) or user.get("is_active") == False:
+        if user.get("blocked", False):
             return web.json_response({"ok": False, "msg": "User is blocked"}, status=401)
 
         if user.get("password") != password:

@@ -32,7 +32,7 @@ install_hysteria() {
     panel_url="${panel_url%/}"
 
     echo "Cloning ANY Node repository..."
-    git clone https://github.com/ReturnFI/Blitz-Node /etc/hysteria >/dev/null 2>&1 || {
+    git clone https://github.com/0xd5f/any-node /etc/hysteria >/dev/null 2>&1 || {
         echo -e "${red}Error:${NC} Failed to clone ANY Node repository"
         exit 1
     }
@@ -51,7 +51,7 @@ install_hysteria() {
     openssl req -new -x509 -days 36500 -key ca.key -out ca.crt -subj "/CN=$sni" >/dev/null 2>&1
     
     echo "Downloading geo data and config..."
-    wget -O /etc/hysteria/config.json https://raw.githubusercontent.com/ReturnFI/Blitz/refs/heads/main/config.json >/dev/null 2>&1 || {
+    wget -O /etc/hysteria/config.json https://raw.githubusercontent.com/0xd5f/ANY/refs/heads/main/config.json >/dev/null 2>&1 || {
         echo -e "${red}Error:${NC} Failed to download config.json"
         exit 1
     }
@@ -239,9 +239,11 @@ async def sync_traffic():
             users_traffic.append(traffic_entry)
             
         await send_traffic_to_panel(users_traffic)
+        return True
 
     except Exception as e:
         logger.error(f"Error executing traffic sync: {e}")
+        return False
 
 # --- Heartbeat Functions ---
 
@@ -279,49 +281,62 @@ def get_system_stats():
         "hysteria_active": hysteria_active
     }
 
-async def send_heartbeat():
+async def send_heartbeat(max_retries=5, base_delay=1):
     if not PANEL_HEARTBEAT_URL:
         return
-
-    try:
-        # Run system stats in thread to avoid blocking loop if necessary, 
-        # though psutil calls here are fast enough except cpu_percent(interval>0)
-        stats = await asyncio.to_thread(get_system_stats)
-
-        async with aiohttp.ClientSession() as session:
-            headers = {
-                "Authorization": PANEL_API_KEY,
-                "Content-Type": "application/json"
-            }
-            async with session.post(PANEL_HEARTBEAT_URL, json=stats, headers=headers, timeout=aiohttp.ClientTimeout(total=20)) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    command = data.get("command")
-                    if command == "restart":
-                        logger.info("Received restart command from panel")
-                        # Adjust service name as needed, typically hysteria-server or hysteria
-                        subprocess.run(["sudo", "systemctl", "restart", "hysteria-server"])
-                else:
-                    logger.error(f"Heartbeat failed: {resp.status}")
-    except Exception as e:
-        logger.error(f"Error sending heartbeat: {e}")
+    attempt = 0
+    while attempt < max_retries:
+        try:
+            stats = await asyncio.to_thread(get_system_stats)
+            async with aiohttp.ClientSession() as session:
+                headers = {
+                    "Authorization": PANEL_API_KEY,
+                    "Content-Type": "application/json"
+                }
+                async with session.post(PANEL_HEARTBEAT_URL, json=stats, headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        command = data.get("command")
+                        if command == "restart":
+                            logger.info("Received restart command from panel")
+                            subprocess.run(["sudo", "systemctl", "restart", "hysteria-server"])
+                        return
+                    else:
+                        logger.error(f"Heartbeat failed: {resp.status}")
+                        return
+        except Exception as e:
+            logger.error(f"Error sending heartbeat (attempt {attempt+1}): {e}")
+        attempt += 1
+        delay = base_delay * (2 ** (attempt - 1))
+        await asyncio.sleep(delay)
+    logger.error(f"All attempts to send heartbeat failed after {max_retries} retries")
 
 async def main():
     logger.info(f"Node Agent started. Name: {NODE_NAME}. Interval: {SYNC_INTERVAL}s")
-    
-    # Initialize CPU counter
     psutil.cpu_percent(interval=None)
-    
+    DEFAULT_SYNC_INTERVAL = SYNC_INTERVAL
+    MAX_SYNC_INTERVAL = 600
+    sync_interval = DEFAULT_SYNC_INTERVAL
     while True:
-        # Run tasks concurrently
-        # We can either run them sequentially or gather them.
-        # Since they both use network, gather is fine.
-        await asyncio.gather(
-            sync_traffic(),
-            send_heartbeat()
-        )
-        
-        await asyncio.sleep(SYNC_INTERVAL)
+        start = time.time()
+        try:
+            results = await asyncio.gather(
+                asyncio.wait_for(sync_traffic(), timeout=60),
+                asyncio.wait_for(send_heartbeat(), timeout=30),
+                return_exceptions=True
+            )
+            had_error = any(isinstance(r, Exception) or r is False for r in results)
+            if had_error:
+                sync_interval = min(sync_interval * 2, MAX_SYNC_INTERVAL)
+                logger.warning(f"Error detected, increasing sync interval to {sync_interval}s")
+            else:
+                sync_interval = DEFAULT_SYNC_INTERVAL
+        except Exception as e:
+            sync_interval = min(sync_interval * 2, MAX_SYNC_INTERVAL)
+            logger.error(f"Critical error in main loop: {e}. Increasing sync interval to {sync_interval}s")
+        elapsed = time.time() - start
+        logger.info(f"Cycle completed in {elapsed:.2f}s. Next in {sync_interval}s")
+        await asyncio.sleep(sync_interval)
 
 if __name__ == "__main__":
     asyncio.run(main())
